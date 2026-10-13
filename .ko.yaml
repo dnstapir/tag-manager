@@ -1,0 +1,5 @@
+defaultPlatforms:
+- linux/amd64
+- linux/arm64
+defaultLdflags:
+  - -X main.commit={{.Git.FullCommit}}

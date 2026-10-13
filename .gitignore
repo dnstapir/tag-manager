@@ -1,0 +1,14 @@
+# Ignore random backed up files
+*.bak
+
+# Don't commit build artifacts
+out/
+
+# Ignore vim buffer files
+*.swp
+*.swo
+
+# Ignore stray configuration files
+config.json
+config.yaml
+config.toml
