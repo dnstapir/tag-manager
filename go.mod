@@ -3,7 +3,7 @@ module github.com/dnstapir/tag-manager
 go 1.27
 
 require (
-	github.com/dnstapir/tapir-analyse-lib v0.0.0-20261013201009-062c7e2470a9
+	github.com/dnstapir/tapir-analyse-lib v0.0.0-20261020110009-06ca396291ea
 	github.com/pelletier/go-toml/v2 v2.2.4
 )
 
