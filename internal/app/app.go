@@ -559,9 +559,9 @@ func (a *appHandle) newAPIServer(addr string, creds []apiCredential) *http.Serve
 		Security:      []map[string][]string{{"apiKey": {}}},
 		DefaultStatus: http.StatusCreated,
 	}, func(ctx context.Context, input *struct {
-		Domain string        `path:"domain" maxLength:"100" pattern:"^[a-zA-Z0-9_-]+([.][a-zA-Z0-9_-]+)*[.]?$" example:"example.com" doc:"Domain to tag"`
-		Tag    string        `path:"tag" maxLength:"30" pattern:"^[a-z0-9_-]+$" example:"internal_testing" doc:"Tag to set"`
-		Body   DomainTagBody `required:"false"`
+		Domain string         `path:"domain" maxLength:"100" pattern:"^[a-zA-Z0-9_-]+([.][a-zA-Z0-9_-]+)*[.]?$" example:"example.com" doc:"Domain to tag"`
+		Tag    string         `path:"tag" maxLength:"30" pattern:"^[a-z0-9_-]+$" example:"internal_testing" doc:"Tag to set"`
+		Body   *DomainTagBody `required:"false"`
 	}) (*struct{}, error) {
 		a.log.Debug("Huma API post-domain-tag (%s)", ctx.Value(userCtxKey{}).(string))
 		domain := normalizeDomain(input.Domain)
@@ -569,7 +569,13 @@ func (a *appHandle) newAPIServer(addr string, creds []apiCredential) *http.Serve
 			return nil, huma.Error422UnprocessableEntity(
 				fmt.Sprintf("tag name '%s' is reserved", input.Tag))
 		}
-		err := a.natsHandle.SetTagStr(ctx, domain, input.Tag, input.Body.Message)
+
+		message := ""
+		if input.Body != nil {
+			message = input.Body.Message
+		}
+
+		err := a.natsHandle.SetTagStr(ctx, domain, input.Tag, message)
 		if err != nil {
 			a.log.Error("Failed to set tag in nats: '%s'", err)
 			return nil, huma.Error502BadGateway("failed to store tag")
