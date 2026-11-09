@@ -17,6 +17,7 @@ import (
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
 	"github.com/dnstapir/tapir-analyse-lib/common"
 	"github.com/dnstapir/tapir-analyse-lib/libtapir"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 const c_N_HANDLERS = 3
@@ -570,6 +571,10 @@ func (a *appHandle) newAPIServer(addr string, apiKeys []string) *http.Server {
 		domain := normalizeDomain(input.Domain)
 		value, err := a.natsHandle.GetTagStr(ctx, domain, input.Tag)
 		if err != nil {
+			if errors.Is(err, jetstream.ErrKeyNotFound) {
+				return nil, huma.Error404NotFound(
+					fmt.Sprintf("tag '%s' not set on '%s'", input.Tag, domain))
+			}
 			a.log.Error("Failed to get tag '%s' for domain '%s': '%s'", input.Tag, domain, err)
 			return nil, huma.Error502BadGateway("failed to look up tag value")
 		}
