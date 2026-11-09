@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"slices"
@@ -327,6 +328,19 @@ func (a *appHandle) Run(ctx context.Context, exitCh chan<- common.Exit) {
 
 	var err error
 	a.exitCh = exitCh
+
+	if a.apiServer != nil {
+		a.seedCustomTags(ctx)
+		if err := a.startAPI(); err != nil {
+			a.log.Error("Failed to start API: '%s'", err)
+			if serr := a.natsHandle.Shutdown(); serr != nil {
+				a.log.Error("Encountered '%s' during NATS shutdown", serr)
+			}
+			a.exitCh <- common.Exit{ID: a.id, Err: err}
+			return
+		}
+	}
+
 	jobChan := make(chan job, 10)
 
 	var wg sync.WaitGroup
@@ -337,11 +351,6 @@ func (a *appHandle) Run(ctx context.Context, exitCh chan<- common.Exit) {
 			}
 			a.log.Info("Worker done!")
 		})
-	}
-
-	if a.apiServer != nil {
-		a.seedCustomTags(ctx)
-		a.startAPI()
 	}
 
 MAIN_APP_LOOP:
@@ -594,14 +603,19 @@ func (a *appHandle) newAPIServer(addr string, apiKeys []string) *http.Server {
 	}
 }
 
-func (a *appHandle) startAPI() {
+func (a *appHandle) startAPI() error {
+	ln, err := net.Listen("tcp", a.apiServer.Addr)
+	if err != nil {
+		return fmt.Errorf("API listen on %s: %w", a.apiServer.Addr, err)
+	}
+	a.log.Info("Starting Huma API on %s", ln.Addr())
 	go func() {
-		a.log.Info("Starting Huma API on %s", a.apiServer.Addr)
-		err := a.apiServer.ListenAndServe()
+		err := a.apiServer.Serve(ln)
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			a.log.Error("API server failed: '%s'", err)
 		}
 	}()
+	return nil
 }
 
 func (a *appHandle) stopAPI() {
