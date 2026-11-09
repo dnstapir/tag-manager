@@ -74,14 +74,14 @@ type nats interface {
 
 // API types
 type DomainTagBody struct {
-	Message string `json:"message,omitempty" maxLength:"100" doc:"Optional message stored with the tag"`
+	Value string `json:"value,omitempty" maxLength:"100" doc:"Optional value stored with the tag"`
 }
 
 type TagValueOutput struct {
 	Body struct {
 		Domain string `json:"domain" example:"example.com"`
 		Tag    string `json:"tag" example:"internal_testing"`
-		Value  string `json:"value" example:"unusual behavior" doc:"Message stored with the tag"`
+		Value  string `json:"value" example:"unusual behavior" doc:"Value stored with the tag"`
 	}
 }
 
@@ -555,7 +555,7 @@ func (a *appHandle) newAPIServer(addr string, creds []apiCredential) *http.Serve
 		OperationID:   "post-domain-tag",
 		Method:        http.MethodPost,
 		Path:          "/domains/{domain}/tags/{tag}",
-		Summary:       "Post a tag for a domain with optional message",
+		Summary:       "Post a tag for a domain with optional value",
 		Security:      []map[string][]string{{"apiKey": {}}},
 		DefaultStatus: http.StatusCreated,
 	}, func(ctx context.Context, input *struct {
@@ -570,12 +570,12 @@ func (a *appHandle) newAPIServer(addr string, creds []apiCredential) *http.Serve
 				fmt.Sprintf("tag name '%s' is reserved", input.Tag))
 		}
 
-		message := ""
+		value := ""
 		if input.Body != nil {
-			message = input.Body.Message
+			value = input.Body.Value
 		}
 
-		err := a.natsHandle.SetTagStr(ctx, domain, input.Tag, message)
+		err := a.natsHandle.SetTagStr(ctx, domain, input.Tag, value)
 		if err != nil {
 			a.log.Error("Failed to set tag in nats: '%s'", err)
 			return nil, huma.Error502BadGateway("failed to store tag")
