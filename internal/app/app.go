@@ -447,7 +447,7 @@ func (a *appHandle) newAPIServer(addr string, apiKeys []string) *http.Server {
 		Security:      []map[string][]string{{"apiKey": {}}},
 		DefaultStatus: http.StatusCreated,
 	}, func(ctx context.Context, input *struct {
-		Domain string        `path:"domain" maxLength:"100" pattern:"^[a-zA-Z0-9._-]+$" example:"example.com" doc:"Domain to tag"`
+		Domain string        `path:"domain" maxLength:"100" pattern:"^[a-zA-Z0-9_-]+([.][a-zA-Z0-9_-]+)*[.]?$" example:"example.com" doc:"Domain to tag"`
 		Tag    string        `path:"tag" maxLength:"30" pattern:"^[a-z0-9_-]+$" example:"internal_testing" doc:"Tag to set"`
 		Body   DomainTagBody `required:"false"`
 	}) (*struct{}, error) {
@@ -537,7 +537,7 @@ func (a *appHandle) newAPIServer(addr string, apiKeys []string) *http.Server {
 		Description: "Returns a list of tags for a supplied domain.",
 		Security:    []map[string][]string{{"apiKey": {}}},
 	}, func(ctx context.Context, input *struct {
-		Domain string `path:"domain" maxLength:"100" pattern:"^[a-zA-Z0-9._-]+$" example:"example.com" doc:"Domain to filter tags"`
+		Domain string `path:"domain" maxLength:"100" pattern:"^[a-zA-Z0-9_-]+([.][a-zA-Z0-9_-]+)*[.]?$" example:"example.com" doc:"Domain to filter tags"`
 	}) (*TagsOutput, error) {
 		a.log.Debug("Huma API get-domain-tags")
 		domain := normalizeDomain(input.Domain)
