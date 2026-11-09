@@ -53,6 +53,7 @@ type appHandle struct {
 	exitCh      chan<- common.Exit
 	apiServer   *http.Server
 	customTags  *customTagSet
+	refreshMu   sync.Mutex
 }
 
 type job struct {
@@ -139,6 +140,17 @@ func (s *customTagSet) list() []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// replace swaps in a new set of names, dropping any that are not in it.
+func (s *customTagSet) replace(names []string) {
+	m := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		m[n] = struct{}{}
+	}
+	s.mu.Lock()
+	s.tags = m
+	s.mu.Unlock()
 }
 
 func isWellDefinedTag(tag string) bool {
@@ -404,17 +416,43 @@ func (a *appHandle) handleTick(ctx context.Context, epoch int64) {
 		return
 	}
 
-	panic("not impl")
+	if !a.refreshMu.TryLock() {
+		a.log.Debug("Previous refresh still running, skipping")
+		return
+	}
+	defer a.refreshMu.Unlock()
+
+	a.refreshCustomTags(ctx)
+}
+
+func (a *appHandle) fetchCustomTags(ctx context.Context) ([]string, error) {
+	filter := common.NormalizeNatsSubject(tagClassCustom + common.NATS_DELIM + ">")
+	keys, err := a.natsHandle.ListTagKeys(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	return customTagNames(keys), nil
 }
 
 func (a *appHandle) seedCustomTags(ctx context.Context) {
-	filter := common.NormalizeNatsSubject(tagClassCustom + common.NATS_DELIM + ">")
-	keys, err := a.natsHandle.ListTagKeys(ctx, filter)
+	names, err := a.fetchCustomTags(ctx)
 	if err != nil {
 		a.log.Error("Failed to seed custom tags from NATS: '%s'", err)
 		return
 	}
-	a.customTags.add(customTagNames(keys)...)
+	a.customTags.add(names...)
+	a.log.Debug("Seeded custom tag cache, %d tags", len(names))
+}
+
+func (a *appHandle) refreshCustomTags(ctx context.Context) {
+	names, err := a.fetchCustomTags(ctx)
+	if err != nil {
+		// Keep the old set on failure rather than wiping the cache.
+		a.log.Error("Failed to refresh custom tags from NATS: '%s'", err)
+		return
+	}
+	a.customTags.replace(names)
+	a.log.Debug("Refreshed custom tag cache, %d tags", len(names))
 }
 
 func (a *appHandle) newAPIServer(addr string, apiKeys []string) *http.Server {
