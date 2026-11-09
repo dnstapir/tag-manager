@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
@@ -32,13 +34,14 @@ const (
 // reservedTags are tag names that collide with static routes under /tags/.
 var reservedTags = []string{tagClassCustom, tagClassWellDefined}
 
-var errNoAPIKeys = errors.New("no API keys configured: set TAG_MANAGER_API_KEY or api_test_key")
+var errNoAPIKeys = errors.New("no API keys configured: set api_users, TAG_MANAGER_API_KEY or api_test_key")
 
 type Conf struct {
-	Debug      bool   `toml:"debug"`
-	Interval   int    `toml:"interval"`
-	APIAddr    string `toml:"api_addr"`
-	APITestKey string `toml:"api_test_key"`
+	Debug      bool      `toml:"debug"`
+	Interval   int       `toml:"interval"`
+	APIAddr    string    `toml:"api_addr"`
+	APITestKey string    `toml:"api_test_key"`
+	APIUsers   []APIUser `toml:"api_users"`
 	AnalystID  string
 	Log        common.Logger
 	NatsHandle nats
@@ -161,6 +164,65 @@ func normalizeDomain(d string) string {
 	return strings.ToLower(strings.TrimSuffix(d, "."))
 }
 
+// API keys
+type APIUser struct {
+	Name      string `toml:"name"`
+	KeySHA256 string `toml:"key_sha256"`
+}
+
+type apiCredential struct {
+	name string
+	hash [sha256.Size]byte
+}
+
+func hashKey(k string) [sha256.Size]byte {
+	return sha256.Sum256([]byte(k))
+}
+
+func parseAPIUsers(users []APIUser) ([]apiCredential, error) {
+	creds := make([]apiCredential, 0, len(users))
+	seen := make(map[string]struct{}, len(users))
+	for _, u := range users {
+		if u.Name == "" {
+			return nil, errors.New("api_users: entry with empty name")
+		}
+		if _, dup := seen[u.Name]; dup {
+			return nil, fmt.Errorf("api_users: duplicate name %q", u.Name)
+		}
+		seen[u.Name] = struct{}{}
+
+		raw, err := hex.DecodeString(strings.TrimSpace(u.KeySHA256))
+		if err != nil || len(raw) != sha256.Size {
+			return nil, fmt.Errorf("api_users: %q has an invalid key_sha256 (want %d hex chars)",
+				u.Name, sha256.Size*2)
+		}
+		var c apiCredential
+		c.name = u.Name
+		copy(c.hash[:], raw)
+		creds = append(creds, c)
+	}
+	return creds, nil
+}
+
+func buildCredentials(envVal string, users []APIUser, testKey string) ([]apiCredential, error) {
+	creds, err := parseAPIUsers(users)
+	if err != nil {
+		return nil, err
+	}
+	for i, k := range parseAPIKeys(envVal) {
+		creds = append(creds, apiCredential{name: fmt.Sprintf("env-%d", i+1), hash: hashKey(k)})
+	}
+	if len(creds) == 0 {
+		for i, k := range parseAPIKeys(testKey) {
+			creds = append(creds, apiCredential{name: fmt.Sprintf("test-%d", i+1), hash: hashKey(k)})
+		}
+	}
+	if len(creds) == 0 {
+		return nil, errNoAPIKeys
+	}
+	return creds, nil
+}
+
 // resolveAPIKeys returns the keys from the first source that yields any:
 // the environment variable first, then the config entry. Both are treated as
 // comma-separated lists. The second return value names the source used.
@@ -187,7 +249,7 @@ func parseAPIKeys(raw string) []string {
 	return keys
 }
 
-func apiKeyAuth(api huma.API, validKeys []string) func(ctx huma.Context, next func(huma.Context)) {
+func apiKeyAuth(api huma.API, creds []apiCredential) func(ctx huma.Context, next func(huma.Context)) {
 	return func(ctx huma.Context, next func(huma.Context)) {
 		// Only enforce on operations that declare the scheme
 		required := false
@@ -202,20 +264,25 @@ func apiKeyAuth(api huma.API, validKeys []string) func(ctx huma.Context, next fu
 			return
 		}
 
-		key := []byte(ctx.Header("X-API-Key"))
+		header := ctx.Header("X-API-Key")
+		sum := hashKey(header)
 
-		// Check every key (no early exit) so timing doesn't reveal which one matched.
-		valid := 0
-		for _, k := range validKeys {
-			valid |= subtle.ConstantTimeCompare(key, []byte(k))
+		// Compare against every credential, no early exit.
+		matched := -1
+		for i, c := range creds {
+			if subtle.ConstantTimeCompare(sum[:], c.hash[:]) == 1 {
+				matched = i
+			}
 		}
-		if len(key) == 0 || valid != 1 {
+		if header == "" || matched < 0 {
 			huma.WriteErr(api, ctx, http.StatusUnauthorized, "invalid or missing API key")
 			return
 		}
-		next(ctx)
+		next(huma.WithValue(ctx, userCtxKey{}, creds[matched].name))
 	}
 }
+
+type userCtxKey struct{}
 
 // <prefix>.tags.custom.<tag-name>.<domain>
 func customTagNames(keys []string) []string {
@@ -314,20 +381,17 @@ func Create(conf Conf) (*appHandle, error) {
 		a.log.Warning("No interval set. Won't refresh list.")
 	}
 
-	apiKeys, source := resolveAPIKeys(os.Getenv("TAG_MANAGER_API_KEY"), conf.APITestKey)
-	if len(apiKeys) == 0 {
-		a.log.Error("%s", errNoAPIKeys)
-		return nil, errNoAPIKeys
-	}
-	if source == "config" {
-		a.log.Warning("TAG_MANAGER_API_KEY not set, using api_test_key from config")
+	creds, err := buildCredentials(os.Getenv("TAG_MANAGER_API_KEY"), conf.APIUsers, conf.APITestKey)
+	if err != nil {
+		a.log.Error("API credentials: '%s'", err)
+		return nil, err
 	}
 
 	addr := conf.APIAddr
 	if addr == "" {
 		addr = c_DEFAULT_API_ADDR
 	}
-	a.apiServer = a.newAPIServer(addr, apiKeys)
+	a.apiServer = a.newAPIServer(addr, creds)
 	a.customTags = newCustomTagSet()
 
 	a.log.Debug("Main app debug logging enabled")
@@ -455,7 +519,7 @@ func (a *appHandle) refreshCustomTags(ctx context.Context) {
 	a.log.Debug("Refreshed custom tag cache, %d tags", len(names))
 }
 
-func (a *appHandle) newAPIServer(addr string, apiKeys []string) *http.Server {
+func (a *appHandle) newAPIServer(addr string, creds []apiCredential) *http.Server {
 	router := http.NewServeMux()
 	config := huma.DefaultConfig("DNS TAPIR Tag Manager API", "0.0.1")
 
@@ -485,7 +549,7 @@ func (a *appHandle) newAPIServer(addr string, apiKeys []string) *http.Server {
 	}
 
 	api := humago.New(router, config)
-	api.UseMiddleware(apiKeyAuth(api, apiKeys))
+	api.UseMiddleware(apiKeyAuth(api, creds))
 
 	huma.Register(api, huma.Operation{
 		OperationID:   "post-domain-tag",
@@ -499,7 +563,7 @@ func (a *appHandle) newAPIServer(addr string, apiKeys []string) *http.Server {
 		Tag    string        `path:"tag" maxLength:"30" pattern:"^[a-z0-9_-]+$" example:"internal_testing" doc:"Tag to set"`
 		Body   DomainTagBody `required:"false"`
 	}) (*struct{}, error) {
-		a.log.Debug("Huma API post-domain-tag")
+		a.log.Debug("Huma API post-domain-tag (%s)", ctx.Value(userCtxKey{}).(string))
 		domain := normalizeDomain(input.Domain)
 		if slices.Contains(reservedTags, input.Tag) {
 			return nil, huma.Error422UnprocessableEntity(
