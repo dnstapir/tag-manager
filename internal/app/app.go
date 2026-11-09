@@ -2,14 +2,16 @@ package app
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
+	"os"
+	"slices"
+	"strings"
 	"sync"
 	"time"
-	"fmt"
-	"strings"
-	"slices"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
@@ -28,10 +30,13 @@ const (
 // reservedTags are tag names that collide with static routes under /tags/.
 var reservedTags = []string{tagClassCustom, tagClassWellDefined}
 
+var errNoAPIKeys = errors.New("no API keys configured: set TAG_MANAGER_API_KEY or api_test_key")
+
 type Conf struct {
-	Debug      bool 	`toml:"debug"`
-	Interval   int  	`toml:"interval"`
-	APIAddr    string   `toml:"api_addr"`
+	Debug      bool   `toml:"debug"`
+	Interval   int    `toml:"interval"`
+	APIAddr    string `toml:"api_addr"`
+	APITestKey string `toml:"api_test_key"`
 	AnalystID  string
 	Log        common.Logger
 	NatsHandle nats
@@ -44,7 +49,8 @@ type appHandle struct {
 	natsHandle  nats
 	ticker      *time.Ticker
 	exitCh      chan<- common.Exit
-	apiServer 	*http.Server
+	apiServer   *http.Server
+	customTags  *customTagSet
 }
 
 type job struct {
@@ -61,12 +67,8 @@ type nats interface {
 }
 
 // API types
-type TagInput struct {
-	Body struct {
-		Tag  	string	`json:"tag" maxLength:"30" example:"internal_testing" doc:"Tag name"`
-		Domain  string 	`json:"domain" maxLength:"100" pattern:"^[a-zA-Z0-9._-]+$" example:"example.com" doc:"Domain to tag"`
-		Message string 	`json:"message,omitempty" maxLength:"100" doc:"Optional message"`
-	}
+type DomainTagBody struct {
+	Message string `json:"message,omitempty" maxLength:"100" doc:"Optional message stored with the tag"`
 }
 
 type TagValueOutput struct {
@@ -101,8 +103,104 @@ type TagsOutput struct {
 	}
 }
 
+// customTagSet is a concurrency-safe set of custom tag names that have been
+// set through this service.
+//
+// NOTE: This relies on tags having an infinite TTL in NATS, so once a custom
+// tag has been seen it is assumed to never disappear. If we ever introduce
+// TTLs or tag deletion, this needs to be revisited (e.g. by re-deriving the
+// set from NATS or by tracking per-tag reference counts).
+type customTagSet struct {
+	mu   sync.RWMutex
+	tags map[string]struct{}
+}
+
+func newCustomTagSet() *customTagSet {
+	return &customTagSet{tags: make(map[string]struct{})}
+}
+
+func (s *customTagSet) add(names ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, n := range names {
+		s.tags[n] = struct{}{}
+	}
+}
+
+// list returns the tags sorted. It never returns nil, so it serializes as [].
+func (s *customTagSet) list() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]string, 0, len(s.tags))
+	for n := range s.tags {
+		out = append(out, n)
+	}
+	slices.Sort(out)
+	return out
+}
+
+func isWellDefinedTag(tag string) bool {
+	return slices.Contains(common.TagNames(), tag)
+}
+
 func normalizeDomain(d string) string {
 	return strings.ToLower(strings.TrimSuffix(d, "."))
+}
+
+// resolveAPIKeys returns the keys from the first source that yields any:
+// the environment variable first, then the config entry. Both are treated as
+// comma-separated lists. The second return value names the source used.
+func resolveAPIKeys(envVal, confVal string) ([]string, string) {
+	if keys := parseAPIKeys(envVal); len(keys) > 0 {
+		return keys, "environment"
+	}
+	if keys := parseAPIKeys(confVal); len(keys) > 0 {
+		return keys, "config"
+	}
+	return nil, ""
+}
+
+// parseAPIKeys splits a comma-separated list of API keys, trimming whitespace
+// and dropping empty entries.
+func parseAPIKeys(raw string) []string {
+	var keys []string
+	for _, k := range strings.Split(raw, ",") {
+		k = strings.TrimSpace(k)
+		if k != "" {
+			keys = append(keys, k)
+		}
+	}
+	return keys
+}
+
+func apiKeyAuth(api huma.API, validKeys []string) func(ctx huma.Context, next func(huma.Context)) {
+	return func(ctx huma.Context, next func(huma.Context)) {
+		// Only enforce on operations that declare the scheme
+		required := false
+		for _, req := range ctx.Operation().Security {
+			if _, ok := req["apiKey"]; ok {
+				required = true
+				break
+			}
+		}
+		if !required {
+			next(ctx)
+			return
+		}
+
+		key := []byte(ctx.Header("X-API-Key"))
+
+		// Check every key (no early exit) so timing doesn't reveal which one matched.
+		valid := 0
+		for _, k := range validKeys {
+			valid |= subtle.ConstantTimeCompare(key, []byte(k))
+		}
+		if len(key) == 0 || valid != 1 {
+			huma.WriteErr(api, ctx, http.StatusUnauthorized, "invalid or missing API key")
+			return
+		}
+		next(ctx)
+	}
 }
 
 // <prefix>.tags.custom.<tag-name>.<domain>
@@ -202,14 +300,25 @@ func Create(conf Conf) (*appHandle, error) {
 		a.log.Warning("No interval set. Won't refresh list.")
 	}
 
-	if conf.APIAddr == "" {
-		a.apiServer = a.newAPIServer(c_DEFAULT_API_ADDR)
-	} else {
-		a.apiServer = a.newAPIServer(conf.APIAddr)
+	apiKeys, source := resolveAPIKeys(os.Getenv("TAG_MANAGER_API_KEY"), conf.APITestKey)
+	if len(apiKeys) == 0 {
+		a.log.Error("%s", errNoAPIKeys)
+		return nil, errNoAPIKeys
 	}
+	if source == "config" {
+		a.log.Warning("TAG_MANAGER_API_KEY not set, using api_test_key from config")
+	}
+
+	addr := conf.APIAddr
+	if addr == "" {
+		addr = c_DEFAULT_API_ADDR
+	}
+	a.apiServer = a.newAPIServer(addr, apiKeys)
+	a.customTags = newCustomTagSet()
 
 	a.log.Debug("Main app debug logging enabled")
 	return a, nil
+
 }
 
 func (a *appHandle) Run(ctx context.Context, exitCh chan<- common.Exit) {
@@ -230,8 +339,9 @@ func (a *appHandle) Run(ctx context.Context, exitCh chan<- common.Exit) {
 	}
 
 	if a.apiServer != nil {
+		a.seedCustomTags(ctx)
 		a.startAPI()
-	}	
+	}
 
 MAIN_APP_LOOP:
 	for {
@@ -287,7 +397,17 @@ func (a *appHandle) handleTick(ctx context.Context, epoch int64) {
 	panic("not impl")
 }
 
-func (a *appHandle) newAPIServer(addr string) *http.Server {
+func (a *appHandle) seedCustomTags(ctx context.Context) {
+	filter := common.NormalizeNatsSubject(tagClassCustom + common.NATS_DELIM + ">")
+	keys, err := a.natsHandle.ListTagKeys(ctx, filter)
+	if err != nil {
+		a.log.Error("Failed to seed custom tags from NATS: '%s'", err)
+		return
+	}
+	a.customTags.add(customTagNames(keys)...)
+}
+
+func (a *appHandle) newAPIServer(addr string, apiKeys []string) *http.Server {
 	router := http.NewServeMux()
 	config := huma.DefaultConfig("DNS TAPIR Tag Manager API", "0.0.1")
 
@@ -307,56 +427,75 @@ func (a *appHandle) newAPIServer(addr string) *http.Server {
 		Name:  "Jonathan Magnusson",
 		Email: "jonathan.magnusson@internetstiftelsen.se",
 	}
+
+	config.Components.SecuritySchemes = map[string]*huma.SecurityScheme{
+		"apiKey": {
+			Type: "apiKey",
+			In:   "header",
+			Name: "X-API-Key",
+		},
+	}
+
 	api := humago.New(router, config)
+	api.UseMiddleware(apiKeyAuth(api, apiKeys))
 
 	huma.Register(api, huma.Operation{
-		OperationID:   "post-tag",
+		OperationID:   "post-domain-tag",
 		Method:        http.MethodPost,
-		Path:          "/tags",
-		Summary:       "Post a tag",
+		Path:          "/domains/{domain}/tags/{tag}",
+		Summary:       "Post a tag for a domain with optional message",
+		Security:      []map[string][]string{{"apiKey": {}}},
 		DefaultStatus: http.StatusCreated,
-	}, func(ctx context.Context, i *TagInput) (*struct{}, error) {
-		a.log.Debug("POST Tag: %+v", i.Body)
-		domain := normalizeDomain(i.Body.Domain)
-		if slices.Contains(reservedTags, i.Body.Tag) {
+	}, func(ctx context.Context, input *struct {
+		Domain string        `path:"domain" maxLength:"100" pattern:"^[a-zA-Z0-9._-]+$" example:"example.com" doc:"Domain to tag"`
+		Tag    string        `path:"tag" maxLength:"30" pattern:"^[a-z0-9_-]+$" example:"internal_testing" doc:"Tag to set"`
+		Body   DomainTagBody `required:"false"`
+	}) (*struct{}, error) {
+		a.log.Debug("Huma API post-domain-tag")
+		domain := normalizeDomain(input.Domain)
+		if slices.Contains(reservedTags, input.Tag) {
 			return nil, huma.Error422UnprocessableEntity(
-				fmt.Sprintf("tag name '%s' is reserved", i.Body.Tag))
+				fmt.Sprintf("tag name '%s' is reserved", input.Tag))
 		}
-		err := a.natsHandle.SetTagStr(ctx, domain, i.Body.Tag, i.Body.Message)
+		err := a.natsHandle.SetTagStr(ctx, domain, input.Tag, input.Body.Message)
 		if err != nil {
 			a.log.Error("Failed to set tag in nats: '%s'", err)
 			return nil, huma.Error502BadGateway("failed to store tag")
 		}
+
+		if !isWellDefinedTag(input.Tag) {
+			a.customTags.add(input.Tag)
+		}
+
 		return nil, nil
 	})
 
 	huma.Register(api, huma.Operation{
 		OperationID: "get-well-defined",
 		Method:      http.MethodGet,
-		Path:        "/tags/well-defined",
-		Summary:     "Get well-defined tags",
+		Path:        "/well-defined/tags",
+		Summary:     "Get a list of well-defined tags",
 		Description: "Returns a list of tags which are defined.",
+		Security:    []map[string][]string{{"apiKey": {}}},
 	}, func(ctx context.Context, _ *struct{}) (*WellDefinedOutput, error) {
+		a.log.Debug("Huma API get-well-defined")
 		out := &WellDefinedOutput{}
 		out.Body.WellDefined = common.TagNames()
+
 		return out, nil
 	})
 
 	huma.Register(api, huma.Operation{
 		OperationID: "get-custom",
 		Method:      http.MethodGet,
-		Path:        "/tags/custom",
-		Summary:     "Get custom tags",
+		Path:        "/custom/tags",
+		Summary:     "Get a list of in-use custom tags",
 		Description: "Returns a list of custom tags in use.",
+		Security:    []map[string][]string{{"apiKey": {}}},
 	}, func(ctx context.Context, _ *struct{}) (*CustomOutput, error) {
+		a.log.Debug("Huma API get-custom")
 		out := &CustomOutput{}
-		filter := common.NormalizeNatsSubject(tagClassCustom + common.NATS_DELIM + ">")
-		keys, err := a.natsHandle.ListTagKeys(ctx, filter)
-		if err != nil {
-			a.log.Error("Failed to list custom tags: '%s'", err)
-			return nil, huma.Error502BadGateway("failed to list custom tags")
-		}
-		out.Body.Custom = customTagNames(keys)
+		out.Body.Custom = a.customTags.list()
 
 		return out, nil
 	})
@@ -364,12 +503,14 @@ func (a *appHandle) newAPIServer(addr string) *http.Server {
 	huma.Register(api, huma.Operation{
 		OperationID: "get-tagged-domains",
 		Method:      http.MethodGet,
-		Path:        "/tags/{tag}",
-		Summary:     "Get tagged domains",
-		Description: "Get a list of domains tagged with the tag.",
-	}, func(ctx context.Context, input *struct{
-		Tag string `path:"tag" maxLength:"30" pattern:"^[a-z0-9_]+$" example:"internal_testing" doc:"Tag to filter domains"`
+		Path:        "/tags/{tag}/domains",
+		Summary:     "Get a list of domains with tag",
+		Description: "Returns a list of domains tagged with supplied tag.",
+		Security:    []map[string][]string{{"apiKey": {}}},
+	}, func(ctx context.Context, input *struct {
+		Tag string `path:"tag" maxLength:"30" pattern:"^[a-z0-9_-]+$" example:"internal_testing" doc:"Tag to filter domains"`
 	}) (*DomainsOutput, error) {
+		a.log.Debug("Huma API get-tagged-domains")
 		out := &DomainsOutput{}
 		tag := common.StringToTag(input.Tag)
 		tagClass := tagClassCustom
@@ -383,7 +524,8 @@ func (a *appHandle) newAPIServer(addr string) *http.Server {
 			a.log.Error("Failed to list domains for tag '%s': '%s'", input.Tag, err)
 			return nil, huma.Error502BadGateway("failed to list tagged domains")
 		}
-		out.Body.Domains = taggedDomains(keys, tagClass, input.Tag) 
+		out.Body.Domains = taggedDomains(keys, tagClass, input.Tag)
+
 		return out, nil
 	})
 
@@ -391,11 +533,13 @@ func (a *appHandle) newAPIServer(addr string) *http.Server {
 		OperationID: "get-domain-tags",
 		Method:      http.MethodGet,
 		Path:        "/domains/{domain}/tags",
-		Summary:     "Get domain tags",
-		Description: "Get a list of tags for a domain.",
-	}, func(ctx context.Context, input *struct{
+		Summary:     "Get a list of tags on domain",
+		Description: "Returns a list of tags for a supplied domain.",
+		Security:    []map[string][]string{{"apiKey": {}}},
+	}, func(ctx context.Context, input *struct {
 		Domain string `path:"domain" maxLength:"100" pattern:"^[a-zA-Z0-9._-]+$" example:"example.com" doc:"Domain to filter tags"`
 	}) (*TagsOutput, error) {
+		a.log.Debug("Huma API get-domain-tags")
 		domain := normalizeDomain(input.Domain)
 		out := &TagsOutput{}
 		parts := []string{"*", "*", libtapir.FlipDomainName(domain)} // any class any tag
@@ -405,7 +549,8 @@ func (a *appHandle) newAPIServer(addr string) *http.Server {
 			a.log.Error("Failed to list tags for domain '%s': '%s'", domain, err)
 			return nil, huma.Error502BadGateway("failed to list domain tags")
 		}
-		out.Body.Tags = domainTags(keys, domain) 
+		out.Body.Tags = domainTags(keys, domain)
+
 		return out, nil
 	})
 
@@ -413,13 +558,15 @@ func (a *appHandle) newAPIServer(addr string) *http.Server {
 		OperationID: "get-domain-tag-value",
 		Method:      http.MethodGet,
 		Path:        "/domains/{domain}/tags/{tag}",
-		Summary:     "Get tag value",
-		Description: "Get the value stored for a tag on a domain.",
+		Summary:     "Get value of tag on domain",
+		Description: "Get the value of a tag on a domain.",
+		Security:    []map[string][]string{{"apiKey": {}}},
 		Errors:      []int{http.StatusNotFound},
 	}, func(ctx context.Context, input *struct {
 		Domain string `path:"domain" maxLength:"100" pattern:"^[a-zA-Z0-9_-]+([.][a-zA-Z0-9_-]+)*[.]?$" example:"example.com" doc:"Domain the tag is set on"`
-		Tag    string `path:"tag" maxLength:"30" pattern:"^[a-z0-9_]+$" example:"internal_testing" doc:"Tag name"`
+		Tag    string `path:"tag" maxLength:"30" pattern:"^[a-z0-9_-]+$" example:"internal_testing" doc:"Tag name"`
 	}) (*TagValueOutput, error) {
+		a.log.Debug("Huma API get-domain-tag-value")
 		domain := normalizeDomain(input.Domain)
 		value, err := a.natsHandle.GetTagStr(ctx, domain, input.Tag)
 		if err != nil {
@@ -431,6 +578,7 @@ func (a *appHandle) newAPIServer(addr string) *http.Server {
 		out.Body.Domain = domain
 		out.Body.Tag = input.Tag
 		out.Body.Value = value
+
 		return out, nil
 	})
 
