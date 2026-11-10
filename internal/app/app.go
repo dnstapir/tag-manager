@@ -37,14 +37,15 @@ var reservedTags = []string{tagClassCustom, tagClassWellDefined}
 var errNoAPIKeys = errors.New("no API keys configured: set api_users, TAG_MANAGER_API_KEY or api_test_key")
 
 type Conf struct {
-	Debug      bool      `toml:"debug"`
-	Interval   int       `toml:"interval"`
-	APIAddr    string    `toml:"api_addr"`
-	APITestKey string    `toml:"api_test_key"`
-	APIUsers   []APIUser `toml:"api_users"`
-	AnalystID  string
-	Log        common.Logger
-	NatsHandle nats
+	Debug           bool      `toml:"debug"`
+	Interval        int       `toml:"interval"`
+	APIAddr         string    `toml:"api_addr"`
+	APITestKey      string    `toml:"api_test_key"`
+	APIUsers        []APIUser `toml:"api_users"`
+	APIAuthDisabled bool      `toml:"api_auth_disabled"`
+	AnalystID       string
+	Log             common.Logger
+	NatsHandle      nats
 }
 
 type appHandle struct {
@@ -217,9 +218,6 @@ func buildCredentials(envVal string, users []APIUser, testKey string) ([]apiCred
 			creds = append(creds, apiCredential{name: fmt.Sprintf("test-%d", i+1), hash: hashKey(k)})
 		}
 	}
-	if len(creds) == 0 {
-		return nil, errNoAPIKeys
-	}
 	return creds, nil
 }
 
@@ -382,9 +380,21 @@ func Create(conf Conf) (*appHandle, error) {
 	}
 
 	creds, err := buildCredentials(os.Getenv("TAG_MANAGER_API_KEY"), conf.APIUsers, conf.APITestKey)
-	if err != nil {
-		a.log.Error("API credentials: '%s'", err)
-		return nil, err
+	if conf.APIAuthDisabled {
+		if err != nil || len(creds) > 0 {
+			a.log.Warning("api_auth_disabled is set, ignoring configured API keys")
+		}
+		a.log.Warning("API authentication is DISABLED (api_auth_disabled = true)")
+		creds = nil
+	} else {
+		if err != nil {
+			a.log.Error("API credentials: '%s'", err)
+			return nil, err
+		}
+		if len(creds) == 0 {
+			a.log.Error("%s", errNoAPIKeys)
+			return nil, errNoAPIKeys
+		}
 	}
 
 	addr := conf.APIAddr
@@ -549,7 +559,9 @@ func (a *appHandle) newAPIServer(addr string, creds []apiCredential) *http.Serve
 	}
 
 	api := humago.New(router, config)
-	api.UseMiddleware(apiKeyAuth(api, creds))
+	if len(creds) > 0 {
+		api.UseMiddleware(apiKeyAuth(api, creds))
+	}
 
 	huma.Register(api, huma.Operation{
 		OperationID:   "post-domain-tag",
@@ -563,7 +575,11 @@ func (a *appHandle) newAPIServer(addr string, creds []apiCredential) *http.Serve
 		Tag    string         `path:"tag" maxLength:"30" pattern:"^[a-z0-9_-]+$" example:"internal_testing" doc:"Tag to set"`
 		Body   *DomainTagBody `required:"false"`
 	}) (*struct{}, error) {
-		a.log.Debug("Huma API post-domain-tag (%s)", ctx.Value(userCtxKey{}).(string))
+		user, _ := ctx.Value(userCtxKey{}).(string)
+		if user == "" {
+			user = "anonymous"
+		}
+		a.log.Debug("Huma API post-domain-tag (%s)", user)
 		domain := normalizeDomain(input.Domain)
 		if slices.Contains(reservedTags, input.Tag) {
 			return nil, huma.Error422UnprocessableEntity(
