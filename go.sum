@@ -6,6 +6,12 @@ github.com/dnstapir/tapir-analyse-lib v0.0.0-20261013201009-062c7e2470a9 h1:b8dx
 github.com/dnstapir/tapir-analyse-lib v0.0.0-20261013201009-062c7e2470a9/go.mod h1:+j8ztfGDfyNeV6tsKFzfu81fHyanQhvfKzQQX8/nB7E=
 github.com/dnstapir/tapir-analyse-lib v0.0.0-20261020110009-06ca396291ea h1:6pAu4d9GfhQM4eFTds11JpmLNnijIKCFdODtAu/6lKs=
 github.com/dnstapir/tapir-analyse-lib v0.0.0-20261020110009-06ca396291ea/go.mod h1:+j8ztfGDfyNeV6tsKFzfu81fHyanQhvfKzQQX8/nB7E=
+github.com/dnstapir/tapir-analyse-lib v0.0.0-20261110152134-a9dc65ad0663 h1:VVtnYmJ8gotEcgb5Nipf1xpXOgrtUEMgv2d6fLncVcw=
+github.com/dnstapir/tapir-analyse-lib v0.0.0-20261110152134-a9dc65ad0663/go.mod h1:+j8ztfGDfyNeV6tsKFzfu81fHyanQhvfKzQQX8/nB7E=
+github.com/dnstapir/tapir-analyse-lib v0.0.0-20261110153233-1d7b2687a20c h1:3piSG/Q6yt0kEwk/SeXo9qpveyYeZJQr/QDXzfJSdDQ=
+github.com/dnstapir/tapir-analyse-lib v0.0.0-20261110153233-1d7b2687a20c/go.mod h1:+j8ztfGDfyNeV6tsKFzfu81fHyanQhvfKzQQX8/nB7E=
+github.com/dnstapir/tapir-analyse-lib v0.0.0-20261110153448-983b88dd3580 h1:R26N0JZPdP25lxT5uQOtgs8A2L+8X+apvoWH4y627xY=
+github.com/dnstapir/tapir-analyse-lib v0.0.0-20261110153448-983b88dd3580/go.mod h1:+j8ztfGDfyNeV6tsKFzfu81fHyanQhvfKzQQX8/nB7E=
 github.com/google/go-cmp v0.7.0 h1:wk8382ETsv4JYUZwIsn6YpYiWiBsYLSJiTsyBybVuN8=
 github.com/google/go-cmp v0.7.0/go.mod h1:pXiqmnSA92OHEEa9HXL2W4E7lf9JzCmGVUdgjX3N/iU=
 github.com/klauspost/compress v1.18.5 h1:/h1gH5Ce+VWNLSWqPzOVn6XBO+vJbCNGvjoaGBFW2IE=
